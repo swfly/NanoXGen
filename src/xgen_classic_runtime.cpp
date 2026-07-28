@@ -1410,6 +1410,23 @@ ClassicFloatRuntimePlan compile_xgen_classic_float_runtime_plan(
     return result;
 }
 
+ClassicFloatRuntimeExpression
+compile_xgen_classic_uniform_float_expression(
+    const ClassicDescription &description,
+    std::string_view object_type,
+    const ClassicAttribute &attribute,
+    std::span<const ClassicAttribute> palette_attributes,
+    std::vector<std::string> &ptex_paths,
+    std::vector<ClassicFloatCustomInput> &custom_inputs,
+    std::vector<ClassicFloatPrefNoiseInput> &pref_noise_inputs) {
+    ClassicObject object{};
+    object.type = std::string{object_type};
+    object.attributes.push_back({"name", description.name, attribute.source_line});
+    return compile_expression(
+        object, attribute, ptex_paths, palette_attributes, custom_inputs,
+        pref_noise_inputs);
+}
+
 float evaluate_xgen_classic_float_runtime_expression(
     const ClassicFloatRuntimeExpression &expression,
     const ClassicFloatRuntimeContext &context) {
