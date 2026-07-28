@@ -9,11 +9,50 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 
 namespace nanoxgen {
 namespace {
+
+using HostPlanClock = std::chrono::steady_clock;
+
+bool host_plan_profile_enabled() noexcept {
+    const char *value = std::getenv("NANOXGEN_PROFILE_HOST_PLAN");
+    return value && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+
+void host_plan_profile(
+    bool enabled,
+    std::string_view description,
+    std::string_view stage,
+    HostPlanClock::time_point begin,
+    const char *profile_file) {
+    if (!enabled) { return; }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          HostPlanClock::now() - begin)
+                          .count();
+    std::fprintf(
+        stderr,
+        "[NanoXGen HostPlan] description='%.*s' stage=%.*s ms=%.3f\n",
+        static_cast<int>(description.size()), description.data(),
+        static_cast<int>(stage.size()), stage.data(), ms);
+    std::fflush(stderr);
+    if (profile_file && *profile_file != '\0') {
+        if (std::FILE *file = std::fopen(profile_file, "ab")) {
+            std::fprintf(
+                file,
+                "[NanoXGen HostPlan] description='%.*s' "
+                "stage=%.*s ms=%.3f\n",
+                static_cast<int>(description.size()), description.data(),
+                static_cast<int>(stage.size()), stage.data(), ms);
+            std::fclose(file);
+        }
+    }
+}
 
 bool descriptions_exist(
     const ClassicCollection &collection,
@@ -395,14 +434,23 @@ build_xgen_classic_collection_motion_execution_plan(
     result.sampling = sampling;
     result.context_worker_count = executor.worker_count();
     result.descriptions.resize(collection.descriptions.size());
+    const bool profile =
+        options.profile || host_plan_profile_enabled();
+    const char *profile_file = options.profile_file.empty()
+        ? nullptr
+        : options.profile_file.c_str();
 
     const auto prepare_description = [&](std::size_t description_index) {
         const ClassicDescription &description =
             collection.descriptions[description_index];
+        const auto description_begin = HostPlanClock::now();
         ClassicCollectionMotionExecutionDescription output{};
         output.name = description.name;
+        const auto runtime_begin = HostPlanClock::now();
         output.runtime = compile_xgen_classic_float_runtime_plan(
             description, collection.palette_attributes);
+        host_plan_profile(profile, description.name, "runtime_compile",
+                          runtime_begin, profile_file);
         if (!output.runtime.lowering_complete()) {
             throw std::runtime_error(
                 "Classic collection description '" + description.name +
@@ -435,6 +483,7 @@ build_xgen_classic_collection_motion_execution_plan(
                  sampling.frames_per_second,
                  sampling.interpolation});
         };
+        const auto import_begin = HostPlanClock::now();
         if (static_deformation) {
             import_sample(0u);
             for (std::size_t sample_index = 1u;
@@ -444,7 +493,10 @@ build_xgen_classic_collection_motion_execution_plan(
         } else {
             executor.parallel_for(output.samples.size(), import_sample);
         }
+        host_plan_profile(profile, description.name, "alembic_import",
+                          import_begin, profile_file);
 
+        const auto roots_begin = HostPlanClock::now();
         ClassicRootPlan reference_roots =
             build_xgen_classic_random_root_plan(
                 description, output.samples.front().surface,
@@ -458,13 +510,19 @@ build_xgen_classic_collection_motion_execution_plan(
         const ClassicRootDeformationTopology deformation_topology =
             prepare_xgen_classic_root_deformation(
                 reference_roots, output.samples.front().surface);
+        host_plan_profile(profile, description.name, "roots_reference",
+                          roots_begin, profile_file);
+        const auto runtime_inputs_begin = HostPlanClock::now();
         output.runtime_inputs = build_xgen_classic_runtime_input_data(
             output.runtime, resolved_descriptions_root / description.name,
             description.patches.front().name, reference_roots, context);
+        host_plan_profile(profile, description.name, "runtime_inputs",
+                          runtime_inputs_begin, profile_file);
 
         // Re-evaluation preserves reference identity and guide association;
         // no RandomGenerator/PTEX work is repeated for later samples.
         if (!static_deformation && output.samples.size() > 1u) {
+            const auto deform_begin = HostPlanClock::now();
             executor.parallel_for(
                 output.samples.size() - 1u, [&](std::size_t relative_index) {
                     const std::size_t sample_index =
@@ -473,7 +531,9 @@ build_xgen_classic_collection_motion_execution_plan(
                         deform_xgen_classic_root_plan(
                             reference_roots, deformation_topology,
                             output.samples[sample_index].surface);
-                });
+                    });
+            host_plan_profile(profile, description.name, "roots_deform",
+                              deform_begin, profile_file);
         }
         output.samples.front().roots.roots =
             std::move(reference_roots.roots);
@@ -489,6 +549,7 @@ build_xgen_classic_collection_motion_execution_plan(
                 imported_samples.push_back(sample_index);
             }
         }
+        const auto guides_begin = HostPlanClock::now();
         executor.parallel_for(
             imported_samples.size(), [&](std::size_t imported_index) {
                 auto &sample =
@@ -496,7 +557,9 @@ build_xgen_classic_collection_motion_execution_plan(
                 sample.rebuilt_guides =
                     rebuild_xgen_classic_guides_for_device(
                         sample.surface.asset, cvs);
-            });
+                });
+        host_plan_profile(profile, description.name, "guides_rebuild",
+                          guides_begin, profile_file);
         const auto equal_bytes = []<typename T>(
                                      const std::vector<T> &a,
                                      const std::vector<T> &b) {
@@ -505,6 +568,7 @@ build_xgen_classic_collection_motion_execution_plan(
                  std::memcmp(
                      a.data(), b.data(), a.size() * sizeof(T)) == 0);
         };
+        const auto dedup_begin = HostPlanClock::now();
         for (std::size_t sample_index = 1u;
              sample_index < output.samples.size(); ++sample_index) {
             auto &sample = output.samples[sample_index];
@@ -529,6 +593,8 @@ build_xgen_classic_collection_motion_execution_plan(
                 }
             }
         }
+        host_plan_profile(profile, description.name, "sample_dedup",
+                          dedup_begin, profile_file);
         std::vector<std::size_t> unique_samples;
         for (std::size_t sample_index = 0u;
              sample_index < output.samples.size(); ++sample_index) {
@@ -539,6 +605,7 @@ build_xgen_classic_collection_motion_execution_plan(
         }
         // Clump guide axes genuinely deform with the patch. Static archives
         // and repeated/strobe lookups reach this expensive path only once.
+        const auto clumps_begin = HostPlanClock::now();
         executor.parallel_for(
             unique_samples.size(), [&](std::size_t unique_index) {
                 auto &sample =
@@ -549,7 +616,9 @@ build_xgen_classic_collection_motion_execution_plan(
                         resolved_descriptions_root / description.name,
                         std::span<const RootSample>{sample.roots.roots},
                         output.runtime, cvs, context);
-            });
+                });
+        host_plan_profile(profile, description.name, "clumps_rebuild",
+                          clumps_begin, profile_file);
         output.runtime.effects.resize(std::min<std::size_t>(
             options.effect_count, output.runtime.effects.size()));
 
@@ -578,6 +647,8 @@ build_xgen_classic_collection_motion_execution_plan(
         output.root_topology.guide_rejected_count =
             reference_roots.guide_rejected_count;
         result.descriptions[description_index] = std::move(output);
+        host_plan_profile(profile, description.name, "description_total",
+                          description_begin, profile_file);
     };
     if (collection.descriptions.size() <= 1u ||
         executor.worker_count() <= 1u) {

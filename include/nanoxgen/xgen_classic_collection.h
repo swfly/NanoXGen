@@ -17,6 +17,8 @@ namespace nanoxgen {
 struct ClassicCollectionExecutionOptions {
     std::uint32_t effect_count{
         std::numeric_limits<std::uint32_t>::max()};
+    bool profile{};
+    std::string profile_file;
     // Optional context shared by description, PTEX, clump, and later JIT work.
     // A null context creates an affinity-aware pool for this call and releases
     // it on return. A supplied context must outlive this call.

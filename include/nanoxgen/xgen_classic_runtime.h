@@ -173,6 +173,19 @@ struct ClassicFloatRuntimeContext {
     const ClassicDescription &description,
     std::span<const ClassicAttribute> palette_attributes = {});
 
+// Compile one description-level custom_float_* expression through the same
+// scalar lowering used by primitive and FX attributes. External input arrays
+// are shared by the caller so a group of primvars can be sampled in one pass.
+[[nodiscard]] ClassicFloatRuntimeExpression
+compile_xgen_classic_uniform_float_expression(
+    const ClassicDescription &description,
+    std::string_view object_type,
+    const ClassicAttribute &attribute,
+    std::span<const ClassicAttribute> palette_attributes,
+    std::vector<std::string> &ptex_paths,
+    std::vector<ClassicFloatCustomInput> &custom_inputs,
+    std::vector<ClassicFloatPrefNoiseInput> &pref_noise_inputs);
+
 // Bind the supported public XGen scalar variables and evaluate the exact same
 // float IR accepted by the LuisaCompute lowering.
 [[nodiscard]] float evaluate_xgen_classic_float_runtime_expression(

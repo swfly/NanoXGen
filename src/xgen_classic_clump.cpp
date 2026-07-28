@@ -10,14 +10,54 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace nanoxgen {
 namespace {
+
+using ClumpClock = std::chrono::steady_clock;
+
+bool clump_profile_enabled() noexcept {
+    const char *value = std::getenv("NANOXGEN_PROFILE_HOST_PLAN");
+    return value && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+
+void clump_profile(
+    bool enabled, std::string_view description, std::size_t module,
+    std::string_view stage, ClumpClock::time_point begin) {
+    if (!enabled) { return; }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          ClumpClock::now() - begin)
+                          .count();
+    std::fprintf(
+        stderr,
+        "[NanoXGen Clump] description='%.*s' module=%zu "
+        "stage=%.*s ms=%.3f\n",
+        static_cast<int>(description.size()), description.data(), module,
+        static_cast<int>(stage.size()), stage.data(), ms);
+    std::fflush(stderr);
+    if (const char *path = std::getenv("NANOXGEN_PROFILE_FILE");
+        path && *path != '\0') {
+        if (std::FILE *file = std::fopen(path, "ab")) {
+            std::fprintf(
+                file,
+                "[NanoXGen Clump] description='%.*s' module=%zu "
+                "stage=%.*s ms=%.3f\n",
+                static_cast<int>(description.size()), description.data(),
+                module, static_cast<int>(stage.size()), stage.data(), ms);
+            std::fclose(file);
+        }
+    }
+}
 
 [[noreturn]] void fail(const std::string &message) {
     throw std::runtime_error("Classic ClumpingFX: " + message);
@@ -114,7 +154,16 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
         module_index, cvs_per_guide, context);
 }
 
-ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
+struct ClassicClumpGeometryCacheEntry {
+    ClassicClumpRuntimeData geometry;
+    std::filesystem::path ptex_path;
+    std::vector<std::uint32_t> global_to_compact;
+};
+
+using ClassicClumpGeometryCache =
+    std::vector<std::optional<ClassicClumpGeometryCacheEntry>>;
+
+ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data_cached(
     const ClassicDescription &description,
     const ClassicAlembicAssetInput &surface,
     const std::filesystem::path &description_directory,
@@ -122,15 +171,28 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
     const ClassicFloatRuntimePlan &runtime_plan,
     std::size_t module_index,
     std::uint32_t cvs_per_guide,
-    NanoXGenContext *context) {
+    NanoXGenContext *context,
+    ClassicClumpGeometryCache &geometry_cache) {
+    const bool profile = clump_profile_enabled();
+    const auto total_begin = ClumpClock::now();
     if (module_index >= runtime_plan.clumps.size()) {
         fail("runtime module index is out of range");
+    }
+    if (geometry_cache.size() != runtime_plan.clumps.size()) {
+        geometry_cache.resize(runtime_plan.clumps.size());
     }
     const ClassicFloatClumpModule &module = runtime_plan.clumps[module_index];
     if (cvs_per_guide < 3u || description.patches.size() != 1u ||
         !surface.reference_surface) {
         fail("binding needs one subdivision patch and at least three CVs");
     }
+    std::unique_ptr<NanoXGenContext> owned_context;
+    if (!context) {
+        owned_context = std::make_unique<NanoXGenContext>();
+        context = owned_context.get();
+    }
+    TaskExecutor &tasks = context->executor();
+    if (!geometry_cache[module_index]) {
     const ClassicPatch &patch = description.patches.front();
     const ClassicObject &object = find_module(description, module.name);
     const std::filesystem::path xpd_path = module_file(
@@ -139,6 +201,7 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
     const std::filesystem::path ptex_path = module_file(
         object, "mapDir", description_directory, module.name,
         patch.name, ".ptx");
+    const auto xpd_begin = ClumpClock::now();
     const XpdDocument xpd = load_xpd_document(xpd_path);
     if (xpd.primitive_type != XpdPrimitiveType::Point ||
         xpd.coordinate_space != XpdCoordinateSpace::World ||
@@ -202,12 +265,10 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
         }
     }
     if (valid_samples.empty()) { fail("clump point file has no valid guides"); }
-    std::unique_ptr<NanoXGenContext> owned_context;
-    if (!context) {
-        owned_context = std::make_unique<NanoXGenContext>();
-        context = owned_context.get();
-    }
-    TaskExecutor &tasks = context->executor();
+    clump_profile(
+        profile, description.name, module_index, "xpd_guides",
+        xpd_begin);
+    const auto axes_begin = ClumpClock::now();
     const ClassicRootPlan guide_roots = build_xgen_classic_explicit_root_plan(
         description, surface, patch.name, valid_samples);
     PackedGeneratedCurves axes = generate_xgen_classic_base_curves_cpu(
@@ -241,9 +302,11 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
     std::vector<ClassicClumpRuntimeData> upstream;
     upstream.reserve(module_index);
     for (std::size_t previous = 0u; previous < module_index; ++previous) {
-        upstream.push_back(build_xgen_classic_clump_runtime_data(
-            description, surface, description_directory, guide_roots,
-            runtime_plan, previous, cvs_per_guide, context));
+        upstream.push_back(build_xgen_classic_clump_runtime_data_cached(
+            description, surface, description_directory,
+            std::span<const RootSample>{guide_roots.roots},
+            runtime_plan, previous, cvs_per_guide, context,
+            geometry_cache));
     }
     const ClassicRuntimeInputData guide_inputs =
         build_xgen_classic_runtime_input_data(
@@ -254,6 +317,9 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
         guide_roots.random_prefixes, guide_roots.primitive_ids, upstream,
         guide_inputs.values, guide_roots.reference_positions, true,
         context);
+    clump_profile(
+        profile, description.name, module_index, "guide_axes",
+        axes_begin);
     std::vector<Vec3> local_axes;
     local_axes.reserve(axes.points.size());
     for (const PackedCurvePoint &point : axes.points) {
@@ -314,7 +380,19 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
         }
         guide = valid_to_runtime[guide];
     }
+    prepare_xgen_classic_clump_runtime_data(result);
+    geometry_cache[module_index].emplace(
+        ClassicClumpGeometryCacheEntry{
+            std::move(result), ptex_path, std::move(global_to_compact)});
+    }
 
+    const auto binding_begin = ClumpClock::now();
+    const ClassicClumpGeometryCacheEntry &cached =
+        *geometry_cache[module_index];
+    ClassicClumpRuntimeData result = cached.geometry;
+    const std::filesystem::path &ptex_path = cached.ptex_path;
+    const std::vector<std::uint32_t> &global_to_compact =
+        cached.global_to_compact;
     const XgenPtexMap metadata_map{ptex_path};
     if (metadata_map.info().channel_count < 3u) {
         fail("clump ID map needs at least three channels");
@@ -373,8 +451,29 @@ ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
             }
         });
     }
-    prepare_xgen_classic_clump_runtime_data(result);
+    clump_profile(
+        profile, description.name, module_index, "ptex_binding",
+        binding_begin);
+    clump_profile(
+        profile, description.name, module_index, "module_total",
+        total_begin);
     return result;
+}
+
+ClassicClumpRuntimeData build_xgen_classic_clump_runtime_data(
+    const ClassicDescription &description,
+    const ClassicAlembicAssetInput &surface,
+    const std::filesystem::path &description_directory,
+    std::span<const RootSample> strand_roots,
+    const ClassicFloatRuntimePlan &runtime_plan,
+    std::size_t module_index,
+    std::uint32_t cvs_per_guide,
+    NanoXGenContext *context) {
+    ClassicClumpGeometryCache geometry_cache(runtime_plan.clumps.size());
+    return build_xgen_classic_clump_runtime_data_cached(
+        description, surface, description_directory, strand_roots,
+        runtime_plan, module_index, cvs_per_guide, context,
+        geometry_cache);
 }
 
 std::vector<ClassicClumpRuntimeData>
@@ -408,20 +507,13 @@ build_xgen_classic_clump_runtime_data_parallel(
         owned_context = std::make_unique<NanoXGenContext>();
         context = owned_context.get();
     }
-    TaskExecutor &tasks = context->executor();
-    if (tasks.worker_count() <= 1u || result.size() == 1u) {
-        for (std::size_t module = 0u; module < result.size(); ++module) {
-            result[module] = build_xgen_classic_clump_runtime_data(
-                description, surface, description_directory, strand_roots,
-                runtime_plan, module, cvs_per_guide, context);
-        }
-        return result;
-    }
-    tasks.parallel_for(result.size(), [&](std::size_t module) {
-        result[module] = build_xgen_classic_clump_runtime_data(
+    ClassicClumpGeometryCache geometry_cache(result.size());
+    for (std::size_t module = 0u; module < result.size(); ++module) {
+        result[module] = build_xgen_classic_clump_runtime_data_cached(
             description, surface, description_directory,
-            strand_roots, runtime_plan, module, cvs_per_guide, context);
-    });
+            strand_roots, runtime_plan, module, cvs_per_guide, context,
+            geometry_cache);
+    }
     return result;
 }
 

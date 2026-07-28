@@ -36,9 +36,10 @@ struct TemporaryDescription {
         std::filesystem::create_directories(map_directory);
         const std::filesystem::path map_path =
             map_directory / "testPatch.ptx";
+        const std::string native_map_path = map_path.string();
         Ptex::String error;
         Ptex::PtexPtr<Ptex::PtexWriter> writer{Ptex::PtexWriter::open(
-            map_path.c_str(), Ptex::mt_quad, Ptex::dt_float, 1, -1, 1,
+            native_map_path.c_str(), Ptex::mt_quad, Ptex::dt_float, 1, -1, 1,
             error, false)};
         if (!writer) { throw std::runtime_error(error.c_str()); }
         require(writer->writeConstantFace(
@@ -165,6 +166,112 @@ void test_full_mask_and_generation() {
                         first.reference_positions[strand] * 2.0f),
                 "runtime $Prefg noise sample mismatch");
     }
+
+    nanoxgen::ClassicDescription primvar_description = description();
+    primvar_description.objects.push_back(
+        {"RendermanRenderer", {}, 7u});
+    auto &renderer_attributes =
+        primvar_description.objects.back().attributes;
+    renderer_attributes.push_back(
+        {"custom_float_curve_id", "rand($id)", 7u});
+    renderer_attributes.push_back(
+        {"custom_float_long", "hash($id)<.5?1:0", 8u});
+    renderer_attributes.push_back(
+        {"custom_color_color",
+         "$a=map('${DESC}/paintmaps/density');#3dpaint\\n$a", 9u});
+    const auto float_primvars =
+        nanoxgen::build_xgen_classic_uniform_float_primvars(
+            primvar_description, palette, 7u, fixture.path, "testPatch",
+            first);
+    require(
+        float_primvars.size() == 2u &&
+            float_primvars[0u].name == "curve_id" &&
+            float_primvars[1u].name == "long" &&
+            float_primvars[0u].values.size() == first.roots.size() &&
+            float_primvars[1u].values.size() == first.roots.size(),
+        "uniform float primvar dimensions mismatch");
+    for (std::size_t strand = 0u; strand < first.roots.size(); ++strand) {
+        require(
+            std::isfinite(float_primvars[0u].values[strand]) &&
+                (float_primvars[1u].values[strand] == 0.0f ||
+                 float_primvars[1u].values[strand] == 1.0f),
+            "uniform float primvar value mismatch");
+    }
+    const auto color_primvars =
+        nanoxgen::build_xgen_classic_uniform_color_primvars(
+            primvar_description, palette, fixture.path, "testPatch", first);
+    require(
+        color_primvars.size() == 1u &&
+            color_primvars.front().name == "color" &&
+            color_primvars.front().values.size() == first.roots.size(),
+        "uniform color primvar dimensions mismatch");
+    for (const nanoxgen::Vec3 value : color_primvars.front().values) {
+        require(
+            value.x == 1.0f && value.y == 1.0f && value.z == 1.0f,
+            "uniform color primvar PTEX sample mismatch");
+    }
+
+    const auto require_primvar_declaration_rejected =
+        [&](std::string name, const char *message) {
+            renderer_attributes.push_back(
+                {std::move(name), "0", 10u});
+            bool rejected = false;
+            try {
+                nanoxgen::validate_xgen_classic_uniform_primvar_declarations(
+                    primvar_description);
+            } catch (const std::runtime_error &) {
+                rejected = true;
+            }
+            renderer_attributes.pop_back();
+            require(rejected, message);
+        };
+    require_primvar_declaration_rejected(
+        "custom_vector_velocity",
+        "unsupported uniform vector primvar was silently omitted");
+    require_primvar_declaration_rejected(
+        "custom_normal_surface_normal",
+        "unsupported uniform normal primvar was silently omitted");
+    require_primvar_declaration_rejected(
+        "custom_point_reference_point",
+        "unsupported uniform point primvar was silently omitted");
+    require_primvar_declaration_rejected(
+        "custom_float_weights[3]",
+        "uniform float primvar array was silently truncated");
+    require_primvar_declaration_rejected(
+        "custom_string_label",
+        "unknown custom primvar declaration was silently omitted");
+    renderer_attributes.push_back(
+        {"custom_color_curve_id", "[1,1,1]", 10u});
+    bool rejected_duplicate_name = false;
+    try {
+        nanoxgen::validate_xgen_classic_uniform_primvar_declarations(
+            primvar_description);
+    } catch (const std::runtime_error &) {
+        rejected_duplicate_name = true;
+    }
+    renderer_attributes.pop_back();
+    require(
+        rejected_duplicate_name,
+        "cross-type duplicate custom primvar name was accepted");
+    renderer_attributes.push_back(
+        {"custom__renderer_private", "0", 10u});
+    nanoxgen::validate_xgen_classic_uniform_primvar_declarations(
+        primvar_description);
+    renderer_attributes.pop_back();
+
+    renderer_attributes.push_back(
+        {"custom_color_unsupported", "zase()", 10u});
+    bool rejected_unsupported_color = false;
+    try {
+        (void)nanoxgen::build_xgen_classic_uniform_color_primvars(
+            primvar_description, palette, fixture.path, "testPatch", first);
+    } catch (const std::runtime_error &) {
+        rejected_unsupported_color = true;
+    }
+    require(
+        rejected_unsupported_color,
+        "unsupported uniform color expression was silently omitted");
+
     constexpr std::size_t parallel_strands = 131072u;
     nanoxgen::ClassicRootPlan repeated{};
     repeated.roots.reserve(parallel_strands);
@@ -593,6 +700,7 @@ void test_description_root_resolution() {
     require(root_relative_rejected,
             "root-relative Classic xgDataPath was accepted");
 
+#if !defined(_WIN32)
     collection.palette_attributes[1u].value = "/";
     collection.palette_attributes[2u].value =
         "/xgen/collections/rabbit";
@@ -601,7 +709,6 @@ void test_description_root_resolution() {
             collection, project / "rabbit.xgen", project) == expected,
         "filesystem-root xgProjectPath was not relocated");
 
-#if !defined(_WIN32)
     collection.palette_attributes[1u].value = "/OLD/RABBIT";
     collection.palette_attributes[2u].value =
         "/old/rabbit/xgen/collections/rabbit";
