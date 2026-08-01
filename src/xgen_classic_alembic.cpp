@@ -16,19 +16,11 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace nanoxgen {
 namespace {
@@ -665,158 +657,6 @@ std::vector<PtexFaceLocation> build_ptex_face_locations(
     return result;
 }
 
-#if defined(_WIN32)
-std::mutex &autodesk_subd_mutex() {
-    static std::mutex mutex;
-    return mutex;
-}
-
-class AutodeskSubdSurface {
-public:
-    AutodeskSubdSurface() noexcept = default;
-    AutodeskSubdSurface(const AutodeskSubdSurface &) = delete;
-    AutodeskSubdSurface &operator=(const AutodeskSubdSurface &) = delete;
-
-    AutodeskSubdSurface(AutodeskSubdSurface &&other) noexcept
-        : _surface{std::exchange(other._surface, nullptr)} {}
-
-    AutodeskSubdSurface &operator=(AutodeskSubdSurface &&other) noexcept {
-        if (this != &other) {
-            reset();
-            _surface = std::exchange(other._surface, nullptr);
-        }
-        return *this;
-    }
-
-    ~AutodeskSubdSurface() noexcept { reset(); }
-
-    [[nodiscard]] explicit operator bool() const noexcept {
-        return _surface != nullptr;
-    }
-
-    [[nodiscard]] SubdSample evaluate(
-        std::uint32_t face, float u, float v) const {
-        if (!_surface) { fail("Autodesk subdivision surface is unavailable"); }
-        std::lock_guard lock{autodesk_subd_mutex()};
-        using EvalMethod = void (*)(
-            void *, int, double, double, double *, double *, double *);
-        auto **vtable = *reinterpret_cast<void ***>(_surface);
-        const auto eval = reinterpret_cast<EvalMethod>(vtable[14u]);
-        double p[3]{};
-        double du[3]{};
-        double dv[3]{};
-        eval(_surface, static_cast<int>(face),
-             static_cast<double>(u), static_cast<double>(v), p, du, dv);
-        const SubdSample result{
-            {static_cast<float>(p[0]), static_cast<float>(p[1]),
-             static_cast<float>(p[2])},
-            {static_cast<float>(du[0]), static_cast<float>(du[1]),
-             static_cast<float>(du[2])},
-            {static_cast<float>(dv[0]), static_cast<float>(dv[1]),
-             static_cast<float>(dv[2])}};
-        if (!std::isfinite(result.position.x) ||
-            !std::isfinite(result.position.y) ||
-            !std::isfinite(result.position.z) ||
-            !std::isfinite(result.du.x) || !std::isfinite(result.du.y) ||
-            !std::isfinite(result.du.z) || !std::isfinite(result.dv.x) ||
-            !std::isfinite(result.dv.y) || !std::isfinite(result.dv.z)) {
-            fail("Autodesk subdivision evaluation produced a non-finite value");
-        }
-        return result;
-    }
-
-    [[nodiscard]] SubdSample evaluate_surface(
-        std::uint32_t face, float u, float surface_v) const {
-        SubdSample result = evaluate(face, u, 1.0f - surface_v);
-        result.dv = {-result.dv.x, -result.dv.y, -result.dv.z};
-        return result;
-    }
-
-    static AutodeskSubdSurface build(
-        const LoadedMesh &mesh, bool reference) {
-        std::lock_guard lock{autodesk_subd_mutex()};
-        HMODULE module = GetModuleHandleW(L"AdskSubEngine.dll");
-        if (!module) { module = LoadLibraryW(L"AdskSubEngine.dll"); }
-        if (!module) { return {}; }
-        using BuildMethod = void *(*)(
-            int, const float *, int, const int *, const int *, bool, bool);
-        using SetLevelMethod = void (*)(void *, int);
-        using SetLogicalMethod = void (*)(void *, bool);
-        const auto build_method = reinterpret_cast<BuildMethod>(GetProcAddress(
-            module, "?build@SESubd@@SAPEAV1@HPEBMHPEBH1_N2@Z"));
-        const auto set_level = reinterpret_cast<SetLevelMethod>(GetProcAddress(
-            module, "?setLevel@SESubd@@QEAAXH@Z"));
-        const auto set_logical = reinterpret_cast<SetLogicalMethod>(GetProcAddress(
-            module, "?setUseLogicalIds@SESubd@@QEAAX_N@Z"));
-        if (!build_method || !set_level || !set_logical) { return {}; }
-        if (mesh.positions.size() > static_cast<std::size_t>(
-                std::numeric_limits<int>::max()) ||
-            mesh.face_counts.size() > static_cast<std::size_t>(
-                std::numeric_limits<int>::max())) {
-            fail("Autodesk subdivision topology exceeds int indexing");
-        }
-        std::vector<float> positions;
-        positions.reserve(mesh.positions.size() * 3u);
-        for (std::uint32_t vertex = 0u;
-             vertex < mesh.positions.size(); ++vertex) {
-            const Vec3 value = reference
-                ? reference_position(mesh, vertex)
-                : position(mesh, vertex);
-            positions.insert(positions.end(), {value.x, value.y, value.z});
-        }
-        std::vector<int> counts(
-            mesh.face_counts.begin(), mesh.face_counts.end());
-        std::vector<int> indices;
-        indices.reserve(mesh.face_indices.size());
-        std::size_t offset{};
-        for (const std::int32_t raw_count : mesh.face_counts) {
-            if (raw_count < 3) {
-                fail("mesh contains a face with fewer than three vertices");
-            }
-            const std::size_t count = static_cast<std::size_t>(raw_count);
-            if (offset > mesh.face_indices.size() ||
-                count > mesh.face_indices.size() - offset) {
-                fail("face counts exceed the face-index array");
-            }
-            for (std::size_t corner = 0u; corner < count; ++corner) {
-                indices.push_back(mesh.face_indices[
-                    offset + count - 1u - corner]);
-            }
-            offset += count;
-        }
-        if (offset != mesh.face_indices.size()) {
-            fail("face counts do not consume the face-index array");
-        }
-        AutodeskSubdSurface result;
-        result._surface = build_method(
-            static_cast<int>(mesh.positions.size()), positions.data(),
-            static_cast<int>(counts.size()), counts.data(), indices.data(),
-            false, false);
-        if (!result._surface) { return {}; }
-        const bool has_nonquad = std::any_of(
-            mesh.face_counts.begin(), mesh.face_counts.end(),
-            [](std::int32_t count) noexcept { return count != 4; });
-        // XGen refines non-quad cages once to expose their logical Ptex faces.
-        set_level(result._surface, has_nonquad ? 1 : 0);
-        set_logical(result._surface, true);
-        return result;
-    }
-
-private:
-    void reset() noexcept {
-        if (!_surface) { return; }
-        std::lock_guard lock{autodesk_subd_mutex()};
-        using DeleteMethod = void *(*)(void *, unsigned int);
-        auto **vtable = *reinterpret_cast<void ***>(_surface);
-        const auto destroy = reinterpret_cast<DeleteMethod>(vtable[0u]);
-        destroy(_surface, 1u);
-        _surface = nullptr;
-    }
-
-    void *_surface{};
-};
-#endif
-
 class SubdEvaluator {
 public:
     SubdEvaluator(const LoadedMesh &mesh,
@@ -832,7 +672,27 @@ public:
             fail("subdivision topology exceeds int indexing");
         }
         std::vector<int> counts(mesh.face_counts.begin(), mesh.face_counts.end());
-        std::vector<int> indices(mesh.face_indices.begin(), mesh.face_indices.end());
+        std::vector<int> indices;
+        indices.reserve(mesh.face_indices.size());
+        std::size_t face_offset{};
+        for (const std::int32_t raw_count : mesh.face_counts) {
+            if (raw_count < 3) {
+                fail("mesh contains a face with fewer than three vertices");
+            }
+            const std::size_t count = static_cast<std::size_t>(raw_count);
+            if (face_offset > mesh.face_indices.size() ||
+                count > mesh.face_indices.size() - face_offset) {
+                fail("face counts exceed the face-index array");
+            }
+            for (std::size_t corner = 0u; corner < count; ++corner) {
+                indices.push_back(mesh.face_indices[
+                    face_offset + count - 1u - corner]);
+            }
+            face_offset += count;
+        }
+        if (face_offset != mesh.face_indices.size()) {
+            fail("face counts do not consume the face-index array");
+        }
         Far::TopologyDescriptor descriptor{};
         descriptor.numVertices = static_cast<int>(mesh.positions.size());
         descriptor.numFaces = static_cast<int>(mesh.face_counts.size());
@@ -923,29 +783,15 @@ public:
         };
         refine(_base_positions, _local_positions);
         refine(_reference_base_positions, _reference_local_positions);
-#if defined(_WIN32)
-        _autodesk_surface = AutodeskSubdSurface::build(mesh, false);
-        _autodesk_reference_surface = AutodeskSubdSurface::build(mesh, true);
-#endif
     }
 
     [[nodiscard]] SubdSample evaluate(std::uint32_t face, float u, float v) const {
-#if defined(_WIN32)
-        if (_autodesk_surface) {
-            return _autodesk_surface.evaluate_surface(face, u, v);
-        }
-#endif
         return evaluate_positions(
             _base_positions, _local_positions, face, u, v);
     }
 
     [[nodiscard]] SubdSample evaluate_reference(
         std::uint32_t face, float u, float v) const {
-#if defined(_WIN32)
-        if (_autodesk_reference_surface) {
-            return _autodesk_reference_surface.evaluate_surface(face, u, v);
-        }
-#endif
         return evaluate_positions(
             _reference_base_positions, _reference_local_positions,
             face, u, v);
@@ -959,17 +805,13 @@ private:
         if (face >= _ptex_faces.size()) {
             fail("subdivision PTEX face is out of range");
         }
-        const PtexFaceLocation &location = _ptex_faces[face];
-        const bool nonquad = location.quadrant_count != 1u;
-        const std::uint32_t evaluation_face = nonquad
-            ? face + location.quadrant_count - 1u -
-                  2u * location.quadrant
-            : face;
-        const float evaluation_u = nonquad ? v : u;
-        const float evaluation_v = nonquad ? u : v;
+        // XGen logical subdivision face ids are OpenSubdiv Ptex face ids.
+        // XGen's surface convention has V reversed relative to PatchMap.
+        const float evaluation_u = u;
+        const float evaluation_v = 1.0f - v;
         const Far::PatchTable::PatchHandle *handle =
             _patch_map->FindPatch(
-                static_cast<int>(evaluation_face),
+                static_cast<int>(face),
                 evaluation_u, evaluation_v);
         if (!handle) { fail("cannot locate OpenSubdiv patch for guide coordinate"); }
         float weights[20u]{};
@@ -1003,25 +845,10 @@ private:
             du.AddWithWeight(*source, du_weights[index]);
             dv.AddWithWeight(*source, dv_weights[index]);
         }
-        Vec3 mapped_du = nonquad ? Vec3{dv.x, dv.y, dv.z}
-                                 : Vec3{du.x, du.y, du.z};
-        Vec3 mapped_dv = nonquad ? Vec3{du.x, du.y, du.z}
-                                 : Vec3{dv.x, dv.y, dv.z};
-        if (!nonquad) {
-            // SESubd evaluates each logical quad through four child faces.
-            // Their local derivative frames rotate with the XGen UV quadrant.
-            const std::uint32_t quadrant = (u >= 0.5f ? 1u : 0u) +
-                (v <= 0.5f ? 2u : 0u);
-            if (quadrant == 1u) {
-                mapped_du = {-dv.x, -dv.y, -dv.z};
-                mapped_dv = {du.x, du.y, du.z};
-            } else if (quadrant >= 2u) {
-                mapped_du = {dv.x, dv.y, dv.z};
-                mapped_dv = {-du.x, -du.y, -du.z};
-            }
-        }
         const SubdSample result{
-            {p.x, p.y, p.z}, mapped_du, mapped_dv};
+            {p.x, p.y, p.z},
+            {du.x, du.y, du.z},
+            {-dv.x, -dv.y, -dv.z}};
         if (!std::isfinite(result.position.x) ||
             !std::isfinite(result.position.y) ||
             !std::isfinite(result.position.z) ||
@@ -1041,10 +868,6 @@ private:
     std::vector<SubdPosition> _local_positions;
     std::vector<SubdPosition> _reference_base_positions;
     std::vector<SubdPosition> _reference_local_positions;
-#if defined(_WIN32)
-    AutodeskSubdSurface _autodesk_surface;
-    AutodeskSubdSurface _autodesk_reference_surface;
-#endif
 };
 
 SurfaceFrame subd_surface_frame(

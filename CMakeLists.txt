@@ -324,7 +324,18 @@ if(NANOXGEN_ENABLE_PTEX)
 endif()
 
 if(NANOXGEN_ENABLE_ALEMBIC AND NANOXGEN_ENABLE_PTEX)
+  set(NANOXGEN_SEEXPR_SOURCES
+    src/xgen_color_expression.cpp
+    third_party/seexpr1/SeCurve.cpp
+    third_party/seexpr1/SeExprBuiltins.cpp
+    third_party/seexpr1/SeExpression.cpp
+    third_party/seexpr1/SeExprFunc.cpp
+    third_party/seexpr1/SeExprNode.cpp
+    third_party/seexpr1/SeNoise.cpp
+    third_party/seexpr1/generated/SeExprParser.cpp
+    third_party/seexpr1/generated/SeExprParserLex.cpp)
   add_library(nanoxgen_classic_native STATIC
+    ${NANOXGEN_SEEXPR_SOURCES}
     src/xgen_classic_collection.cpp
     src/xgen_classic_clump.cpp
     src/xgen_classic_ptex.cpp
@@ -332,8 +343,15 @@ if(NANOXGEN_ENABLE_ALEMBIC AND NANOXGEN_ENABLE_PTEX)
     src/xgen_samples.cpp)
   add_library(NanoXGen::nanoxgen_classic_native ALIAS nanoxgen_classic_native)
   target_include_directories(
-    nanoxgen_classic_native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    nanoxgen_classic_native
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/seexpr1
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/seexpr1/generated)
   target_compile_features(nanoxgen_classic_native PUBLIC cxx_std_20)
+  target_compile_definitions(
+    nanoxgen_classic_native PRIVATE
+    $<$<PLATFORM_ID:Windows>:SEEXPR_WIN32>)
   target_link_libraries(nanoxgen_classic_native PUBLIC
     nanoxgen_classic_alembic nanoxgen_ptex)
   target_link_libraries(nanoxgen_classic_native PRIVATE nanoxgen_build_options)
@@ -354,6 +372,13 @@ if(NANOXGEN_ENABLE_ALEMBIC AND NANOXGEN_ENABLE_PTEX)
   target_link_libraries(
     nanoxgen_xgen_classic_motion PRIVATE nanoxgen_classic_native)
   if(NANOXGEN_BUILD_TESTS)
+    add_executable(
+      nanoxgen_color_expression_tests tests/color_expression_test.cpp)
+    target_link_libraries(
+      nanoxgen_color_expression_tests PRIVATE nanoxgen_classic_native)
+    add_test(
+      NAME nanoxgen_color_expression_tests
+      COMMAND nanoxgen_color_expression_tests)
     add_executable(nanoxgen_classic_root_tests tests/classic_root_test.cpp)
     target_link_libraries(
       nanoxgen_classic_root_tests PRIVATE nanoxgen_classic_native)
