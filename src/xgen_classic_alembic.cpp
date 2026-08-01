@@ -876,20 +876,43 @@ SurfaceFrame subd_surface_frame(
     try {
         return xgen_surface_frame(sample.du, sample.dv);
     } catch (const std::runtime_error &) {
-        constexpr float inset = 1.0e-4f;
-        const float safe_u = std::clamp(u, inset, 1.0f - inset);
-        const float safe_v = std::clamp(v, inset, 1.0f - inset);
-        if (safe_u == u && safe_v == v) { throw; }
-        const SubdSample safe_sample = reference
-            ? evaluator.evaluate_reference(face, safe_u, safe_v)
-            : evaluator.evaluate(face, safe_u, safe_v);
-        try {
-            return xgen_surface_frame(safe_sample.du, safe_sample.dv);
-        } catch (const std::runtime_error &error) {
-            fail("cannot construct frame for PTEX face " +
-                 std::to_string(face) + " at (" + std::to_string(u) +
-                 ", " + std::to_string(v) + "): " + error.what());
+        // At an extraordinary corner the limit-surface parameterization can
+        // have coincident analytic derivatives. XGen's level-one logical-face
+        // evaluator still returns a frame there. Recover the same geometric
+        // directions with independent one-sided U/V secants; a diagonal inset
+        // keeps both derivatives on the singular parameter line.
+        for (const float step : {1.0e-3f, 1.0e-2f}) {
+            const float other_u = u <= 0.5f
+                ? std::min(1.0f, u + step)
+                : std::max(0.0f, u - step);
+            const float other_v = v <= 0.5f
+                ? std::min(1.0f, v + step)
+                : std::max(0.0f, v - step);
+            if (other_u == u || other_v == v) { continue; }
+            const SubdSample u_sample = reference
+                ? evaluator.evaluate_reference(face, other_u, v)
+                : evaluator.evaluate(face, other_u, v);
+            const SubdSample v_sample = reference
+                ? evaluator.evaluate_reference(face, u, other_v)
+                : evaluator.evaluate(face, u, other_v);
+            const float inverse_u = 1.0f / (other_u - u);
+            const float inverse_v = 1.0f / (other_v - v);
+            const Vec3 finite_du{
+                (u_sample.position.x - sample.position.x) * inverse_u,
+                (u_sample.position.y - sample.position.y) * inverse_u,
+                (u_sample.position.z - sample.position.z) * inverse_u};
+            const Vec3 finite_dv{
+                (v_sample.position.x - sample.position.x) * inverse_v,
+                (v_sample.position.y - sample.position.y) * inverse_v,
+                (v_sample.position.z - sample.position.z) * inverse_v};
+            try {
+                return xgen_surface_frame(finite_du, finite_dv);
+            } catch (const std::runtime_error &) {
+            }
         }
+        fail("cannot construct frame for PTEX face " +
+             std::to_string(face) + " at (" + std::to_string(u) +
+             ", " + std::to_string(v) + ")");
     }
 }
 
