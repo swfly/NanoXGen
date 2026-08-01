@@ -37,7 +37,7 @@ using CutShader = PrimitiveShader;
 using ClumpShader = Shader1D<
     Buffer<float4>, Buffer<float4>, ByteBuffer, Buffer<uint>, Buffer<float>,
     Buffer<float4>, Buffer<float4>, Buffer<float4>, Buffer<uint>,
-    Buffer<uint>>;
+    Buffer<float>, Buffer<uint>>;
 
 double milliseconds(Clock::time_point begin, Clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -123,6 +123,7 @@ void ClassicCollectionPipeline::encode(
         resources.clump_axes.size() != pipeline.clumps.size() ||
         resources.clump_frames.size() != pipeline.clumps.size() ||
         resources.clump_runtime.size() != pipeline.clumps.size() ||
+        resources.clump_guide_inputs.size() != pipeline.clumps.size() ||
         resources.clump_strand_guides.size() != pipeline.clumps.size()) {
         throw std::invalid_argument(
             "Classic collection dispatch resources are inconsistent");
@@ -155,6 +156,7 @@ void ClassicCollectionPipeline::encode(
                     resources.clump_axes[effect.module_index],
                     resources.clump_frames[effect.module_index],
                     resources.clump_runtime[effect.module_index],
+                    resources.clump_guide_inputs[effect.module_index],
                     resources.clump_strand_guides[effect.module_index])
                 : shader(
                     resources.points_a, resources.points_b, resources.roots,
@@ -163,6 +165,7 @@ void ClassicCollectionPipeline::encode(
                     resources.clump_axes[effect.module_index],
                     resources.clump_frames[effect.module_index],
                     resources.clump_runtime[effect.module_index],
+                    resources.clump_guide_inputs[effect.module_index],
                     resources.clump_strand_guides[effect.module_index]))
                 .dispatch(strand_count);
         } else if (effect.type == ClassicFloatEffectType::Noise) {
@@ -288,12 +291,33 @@ ClassicCollectionPipeline compile_classic_collection(
     impl->descriptions.resize(descriptions.size());
     for (std::size_t index = 0u; index < descriptions.size(); ++index) {
         const ClassicCollectionCompileInput &input = descriptions[index];
-        if (!input.runtime || !input.runtime->lowering_complete() ||
-            input.cvs_per_strand < 2u ||
-            input.clump_guide_counts.size() !=
-                input.runtime->clumps.size()) {
+        if (!input.runtime) {
             throw std::invalid_argument(
-                "Classic collection compile input is inconsistent");
+                "Classic collection compile input " +
+                std::to_string(index) + " has no runtime");
+        }
+        if (!input.runtime->lowering_complete()) {
+            throw std::invalid_argument(
+                "Classic collection description '" +
+                input.runtime->description_name +
+                "' is not fully lowered");
+        }
+        if (input.cvs_per_strand < 2u) {
+            throw std::invalid_argument(
+                "Classic collection description '" +
+                input.runtime->description_name +
+                "' has invalid cvs_per_strand=" +
+                std::to_string(input.cvs_per_strand));
+        }
+        if (input.clump_guide_counts.size() !=
+            input.runtime->clumps.size()) {
+            throw std::invalid_argument(
+                "Classic collection description '" +
+                input.runtime->description_name +
+                "' has clump guide count size=" +
+                std::to_string(input.clump_guide_counts.size()) +
+                ", expected=" +
+                std::to_string(input.runtime->clumps.size()));
         }
         auto &output = impl->descriptions[index];
         output.name = input.runtime->description_name;
@@ -319,20 +343,33 @@ ClassicCollectionPipeline compile_classic_collection(
     shader_option.enable_fast_math = options.fast_math;
     const Clock::time_point compile_begin = Clock::now();
 
-    const auto launch = [&](auto kernel, auto &shader_slot) {
-        using Kernel = std::decay_t<decltype(kernel)>;
+    const auto launch = [&]<typename Kernel>(
+                            std::string description,
+                            std::string kernel_name,
+                            Kernel kernel, auto &shader_slot) {
         const std::size_t timing_index = timings.size();
         timings.emplace_back();
         auto kernel_state =
             std::make_shared<Kernel>(std::move(kernel));
         tasks.emplace_back(
-            [&, kernel_state = std::move(kernel_state),
+            [&, description = std::move(description),
+             kernel_name = std::move(kernel_name),
+             kernel_state = std::move(kernel_state),
              slot = &shader_slot, timing_index]() mutable {
                 const Clock::time_point begin = Clock::now();
+                if (options.profile_task) {
+                    options.profile_task(
+                        description, kernel_name, true, 0.0);
+                }
                 slot->emplace(device.compile(
                     std::move(*kernel_state), shader_option));
                 const Clock::time_point end = Clock::now();
                 timings[timing_index] = {begin, end};
+                if (options.profile_task) {
+                    options.profile_task(
+                        description, kernel_name, false,
+                        milliseconds(begin, end));
+                }
             });
     };
 
@@ -341,14 +378,17 @@ ClassicCollectionPipeline compile_classic_collection(
         const ClassicFloatRuntimePlan &runtime = *input.runtime;
         auto &output = impl->descriptions[index];
         launch(
+            output.name, "base",
             make_classic_base_generate_kernel(
                 input.cvs_per_strand, 0.0f, 1.0f, input.root_relative),
             output.base);
         launch(
+            output.name, "primitive",
             make_classic_runtime_primitive_kernel(
                 runtime, input.cvs_per_strand),
             output.primitive);
         launch(
+            output.name, "width",
             make_classic_runtime_width_kernel(
                 runtime, input.cvs_per_strand),
             output.width);
@@ -361,6 +401,8 @@ ClassicCollectionPipeline compile_classic_collection(
                 if (!scheduled_noises.at(effect.module_index)) {
                     scheduled_noises[effect.module_index] = true;
                     launch(
+                        output.name,
+                        "noise[" + std::to_string(effect.module_index) + "]",
                         make_classic_runtime_noise_kernel(
                             runtime, runtime.noises.at(effect.module_index),
                             input.cvs_per_strand),
@@ -371,6 +413,8 @@ ClassicCollectionPipeline compile_classic_collection(
                 if (!scheduled_cuts.at(effect.module_index)) {
                     scheduled_cuts[effect.module_index] = true;
                     launch(
+                        output.name,
+                        "cut[" + std::to_string(effect.module_index) + "]",
                         make_classic_runtime_cut_kernel(
                             runtime, runtime.cuts.at(effect.module_index),
                             input.cvs_per_strand),
@@ -381,6 +425,8 @@ ClassicCollectionPipeline compile_classic_collection(
                 if (!scheduled_clumps.at(effect.module_index)) {
                     scheduled_clumps[effect.module_index] = true;
                     launch(
+                        output.name,
+                        "clump[" + std::to_string(effect.module_index) + "]",
                         make_classic_runtime_clump_kernel(
                             runtime, runtime.clumps.at(effect.module_index),
                             input.cvs_per_strand,

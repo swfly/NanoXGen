@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -34,6 +35,11 @@ struct ClassicCollectionCompileOptions {
     // this compile call and releases it on return. A supplied context can be
     // reused for host preparation and later JIT batches.
     NanoXGenContext *context{};
+    // Optional thread-safe callback for profiling individual JIT tasks.
+    // `begin` is true before Device::compile and false after it returns.
+    std::function<void(
+        std::string_view description, std::string_view kernel,
+        bool begin, double elapsed_ms)> profile_task;
 };
 
 struct ClassicCollectionCompileStats {
@@ -65,6 +71,7 @@ struct ClassicCollectionDispatchResources {
     std::span<const luisa::compute::BufferView<luisa::float4>> clump_axes;
     std::span<const luisa::compute::BufferView<luisa::float4>> clump_frames;
     std::span<const luisa::compute::BufferView<luisa::uint>> clump_runtime;
+    std::span<const luisa::compute::BufferView<float>> clump_guide_inputs;
     std::span<const luisa::compute::BufferView<luisa::uint>>
         clump_strand_guides;
 };

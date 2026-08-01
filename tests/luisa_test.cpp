@@ -117,7 +117,7 @@ void test_external_device_collection_compile(
             root_runtime_buffer.view(), runtime_input_buffer.view(),
             tangent_buffer.view(), noise_domain_buffer.view(),
             points_a.view(), points_b.view(), states.view(),
-            {}, {}, {}, {}};
+            {}, {}, {}, {}, {}};
     std::array<luisa::float4, 4u> output{};
     stream << root_buffer.copy_from(roots.data())
            << offset_buffer.copy_from(offsets.data())
@@ -147,7 +147,7 @@ void test_external_device_collection_compile(
             root_runtime_buffer.view(), runtime_input_buffer.view(),
             tangent_buffer.view(), noise_domain_buffer.view(),
             motion_points_a.view(), motion_points_b.view(),
-            motion_states.view(), {}, {}, {}, {}};
+            motion_states.view(), {}, {}, {}, {}, {}};
     const std::array<
         nanoxgen::luisa_backend::ClassicCollectionDispatchResources, 3u>
         motion_samples{{resources, motion_resources, resources}};
@@ -305,6 +305,7 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
     nanoxgen::ClassicDescription description{};
     description.name = "luisaEffects";
     description.attributes.push_back({"descriptionId", "9", 1u});
+    description.attributes.push_back({"strayPercentage", "35", 1u});
     description.objects.push_back({"SplinePrimitive", {
         {"fxCVCount", "7", 2u},
         {"length", "0.9+0.2*map('fixture')", 3u},
@@ -313,13 +314,13 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
         {"widthRamp", "rampUI(0,1,1:1,0.8,1)", 7u}}, 2u});
     description.objects.push_back({"ClumpingFXModule", {
         {"active", "true", 8u}, {"name", "clump", 9u},
-        {"mask", "0.75", 10u}, {"clump", "0.6", 11u},
-        {"clumpScale", "rampUI(0,0.5,1:1,0,1)", 12u},
+        {"mask", "0.75", 10u}, {"clump", "map('fixture')", 11u},
+        {"clumpScale", "rampUI(0,0.25,1:1,0,1)", 12u},
         {"clumpVariance", "0", 13u}, {"cut", "0", 14u},
         {"copy", "0", 15u}, {"copyVariance", "0", 16u},
         {"curl", "0", 17u}, {"offset", "0", 18u},
         {"flatness", "0", 19u}, {"frame", "0", 20u},
-        {"noise", "0.02", 21u},
+        {"noise", "stray()?0.02:0.01", 21u},
         {"noiseScale", "rampUI(0,0,1:1,1,1)", 22u},
         {"noiseFrequency", "1.7", 23u},
         {"noiseCorrelation", "20", 24u},
@@ -337,7 +338,8 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
         {"rebuildType", "1", 39u}}, 36u});
     const nanoxgen::ClassicFloatRuntimePlan plan =
         nanoxgen::compile_xgen_classic_float_runtime_plan(description);
-    if (!plan.lowering_complete() || plan.clumps.size() != 1u ||
+    if (!plan.lowering_complete() || !plan.stray_percentage ||
+        plan.clumps.size() != 1u ||
         plan.noises.size() != 1u || plan.cuts.size() != 1u ||
         plan.effects.size() != 3u) {
         throw std::runtime_error("Luisa Classic effects fixture did not lower");
@@ -358,7 +360,11 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
     std::vector<std::uint32_t> primitive_ids(strand_count);
     std::vector<std::uint32_t> prefixes(strand_count);
     std::vector<std::uint32_t> root_runtime(strand_count * 2u);
-    std::vector<float> ptex_values(strand_count);
+    const std::size_t runtime_input_stride =
+        plan.ptex_paths.size() + plan.custom_inputs.size() +
+        plan.pref_noise_inputs.size();
+    std::vector<float> ptex_values(
+        static_cast<std::size_t>(strand_count) * runtime_input_stride);
     for (std::uint32_t strand = 0u; strand < strand_count; ++strand) {
         const float root_x = static_cast<float>(strand % 8u) * 0.07f;
         const float root_z = static_cast<float>(strand / 8u) * 0.06f;
@@ -384,7 +390,11 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
         prefixes[strand] = nanoxgen::xgen_seexpr_hash_prefix(prefix_input);
         root_runtime[strand * 2u] = primitive_ids[strand];
         root_runtime[strand * 2u + 1u] = prefixes[strand];
-        ptex_values[strand] = static_cast<float>(strand % 7u) / 6.0f;
+        const float strand_input = static_cast<float>(strand % 7u) / 6.0f;
+        for (std::size_t input = 0u; input < runtime_input_stride; ++input) {
+            ptex_values[static_cast<std::size_t>(strand) *
+                            runtime_input_stride + input] = strand_input;
+        }
         for (std::uint32_t cv = 0u; cv < cvs; ++cv) {
             const float t = static_cast<float>(cv) /
                             static_cast<float>(cvs - 1u);
@@ -422,6 +432,11 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
             plan.description_id, plan.description_name, 2u))};
     clump_data.guide_random_prefixes = {
         nanoxgen::xgen_seexpr_hash_prefix(guide_prefix_input)};
+    clump_data.guide_runtime_input_stride = static_cast<std::uint32_t>(
+        plan.ptex_paths.size() + plan.custom_inputs.size() +
+        plan.pref_noise_inputs.size());
+    clump_data.guide_runtime_inputs.assign(
+        clump_data.guide_runtime_input_stride, 0.85f);
     clump_data.strand_guide_indices.assign(strand_count, 0u);
     clump_data.strand_guide_indices.back() = nanoxgen::kInvalidIndex;
     nanoxgen::prepare_xgen_classic_clump_runtime_data(clump_data);
@@ -467,7 +482,11 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
             clump_data.guide_reference_positions.front().x,
             clump_data.guide_reference_positions.front().y,
             clump_data.guide_reference_positions.front().z,
-            clump_data.guide_spline_lengths.front())};
+            clump_data.guide_spline_lengths.front()),
+        luisa::make_float4(
+            clump_data.guide_axes.front().x,
+            clump_data.guide_axes.front().y,
+            clump_data.guide_axes.front().z, 0.0f)};
     const std::array<std::uint32_t, 2u> clump_runtime{
         clump_data.guide_face_ids.front(),
         clump_data.guide_random_prefixes.front()};
@@ -477,6 +496,8 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
         device.create_buffer<luisa::float4>(clump_frames.size());
     auto clump_runtime_buffer =
         device.create_buffer<std::uint32_t>(clump_runtime.size());
+    auto clump_guide_inputs_buffer = device.create_buffer<float>(
+        clump_data.guide_runtime_inputs.size());
     auto clump_guides_buffer = device.create_buffer<std::uint32_t>(
         clump_data.strand_guide_indices.size());
     auto a = device.create_buffer<luisa::float4>(source.size());
@@ -505,14 +526,17 @@ float test_luisa_classic_effects(Device &device, Stream &stream) {
            << clump_axes_buffer.copy_from(clump_axes.data())
            << clump_frames_buffer.copy_from(clump_frames.data())
            << clump_runtime_buffer.copy_from(clump_runtime.data())
+           << clump_guide_inputs_buffer.copy_from(
+                  clump_data.guide_runtime_inputs.data())
            << clump_guides_buffer.copy_from(
                   clump_data.strand_guide_indices.data())
            << a.copy_from(source.data())
            << primitive(a, b, roots, runtime, ptex, states)
                   .dispatch(strand_count)
            << clump(b, a, roots, runtime, ptex, states,
-                    clump_axes_buffer, clump_frames_buffer,
-                    clump_runtime_buffer, clump_guides_buffer)
+                     clump_axes_buffer, clump_frames_buffer,
+                     clump_runtime_buffer, clump_guide_inputs_buffer,
+                     clump_guides_buffer)
                   .dispatch(strand_count)
            << noise(a, b, roots, runtime, ptex, tangent_buffer,
                     noise_domain_buffer, states)

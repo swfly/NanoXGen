@@ -86,6 +86,7 @@ nanoxgen::ClassicAlembicAssetInput surface() {
     nanoxgen::GuideInput guide{};
     guide.cvs = {{0.5f, 0.0f, 0.5f}, {0.5f, 1.0f, 0.5f}};
     guide.root_uv = {0.5f, 0.5f};
+    guide.surface_face_id = 0u;
     guide.triangle_index = 0u;
     guide.barycentric = {0.0f, 0.5f};
     guide.reference_root_position = guide.cvs.front();
@@ -98,6 +99,35 @@ nanoxgen::ClassicAlembicAssetInput surface() {
         {"testPatch", 0u, 0u, 2u, 1u, 1.0f,
          1.0f, 1.0f, {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 1.0f}});
     return result;
+}
+
+void test_guide_generator_plan() {
+    nanoxgen::ClassicDescription input = description();
+    input.bindings.push_back({"Active", "GuideGenerator", 4u});
+    nanoxgen::ClassicGuide source_guide{};
+    source_guide.id = 42u;
+    source_guide.patch_u = 0.5;
+    source_guide.patch_v = 0.5;
+    source_guide.face_id = 0u;
+    input.patches.front().guides.push_back(source_guide);
+
+    const nanoxgen::ClassicAlembicAssetInput imported = surface();
+    const nanoxgen::ClassicRootPlan roots =
+        nanoxgen::build_xgen_classic_root_plan(input, imported, {});
+    require(roots.candidate_count == 1u && roots.roots.size() == 1u &&
+                roots.primitive_ids == std::vector<std::uint32_t>{42u} &&
+                roots.influence_offsets == std::vector<std::uint32_t>{0u, 1u} &&
+                roots.influences.size() == 1u &&
+                roots.influences.front().guide_index == 0u &&
+                roots.influences.front().weight == 1.0f,
+            "GuideGenerator did not emit one self-associated guide root");
+    const nanoxgen::PackedGeneratedCurves curves =
+        nanoxgen::generate_xgen_classic_base_curves_cpu(
+            imported.asset, roots, 4u);
+    require(curves.strand_count == 1u && curves.points.size() == 4u &&
+                curves.points.front().x == 0.5f &&
+                curves.points.front().z == 0.5f,
+            "GuideGenerator base curve root mismatch");
 }
 
 void test_full_mask_and_generation() {
@@ -732,6 +762,7 @@ void test_description_root_resolution() {
 } // namespace
 
 int main() try {
+    test_guide_generator_plan();
     test_full_mask_and_generation();
     test_relocated_description_data_paths();
     test_partial_mask_and_limit();

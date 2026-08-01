@@ -270,6 +270,28 @@ void test_float_runtime_plan() {
 }
 
 void test_float_runtime_fallbacks_and_validation() {
+    ClassicDescription cached{};
+    cached.name = "cached";
+    cached.objects.push_back({"SplinePrimitive", {
+        {"useCache", "true", 1u},
+        {"liveMode", "false", 2u},
+        {"cacheFileName", "C:/cache/guides.abc", 3u}}, 1u});
+    const ClassicFloatRuntimePlan cached_plan =
+        compile_xgen_classic_float_runtime_plan(cached);
+    require(cached_plan.lowering_complete() &&
+                cached_plan.use_guide_cache &&
+                !cached_plan.guide_cache_live_mode &&
+                cached_plan.guide_cache_file == "C:/cache/guides.abc",
+            "SplinePrimitive guide-cache settings were not retained");
+
+    ClassicDescription missing_cache = cached;
+    missing_cache.objects.front().attributes.back().value.clear();
+    const ClassicFloatRuntimePlan missing_cache_plan =
+        compile_xgen_classic_float_runtime_plan(missing_cache);
+    require(!missing_cache_plan.lowering_complete() &&
+                !missing_cache_plan.fallback_reasons.empty(),
+            "enabled guide cache without a file did not request fallback");
+
     ClassicDescription unsupported{};
     unsupported.name = "unsupported";
     unsupported.objects.push_back({"SplinePrimitive", {
@@ -454,6 +476,19 @@ void test_float_runtime_clump() {
                 plan.effects.size() == 1u &&
                 plan.effects[0].type == ClassicFloatEffectType::Clump,
             "basic ClumpingFX module did not lower");
+    require(!plan.stray_percentage,
+            "unused stray percentage was retained in the runtime plan");
+    description.attributes.push_back({"strayPercentage", "15", 21u});
+    for (ClassicAttribute &attribute : description.objects.back().attributes) {
+        if (attribute.name == "noise") {
+            attribute.value = "stray()?0:2";
+        }
+    }
+    const ClassicFloatRuntimePlan stray_plan =
+        compile_xgen_classic_float_runtime_plan(description);
+    require(stray_plan.lowering_complete() && stray_plan.stray_percentage &&
+                stray_plan.clumps.size() == 1u,
+            "ClumpingFX stray() expression did not lower");
     PackedGeneratedCurves curves{};
     curves.strand_count = 1u;
     curves.cvs_per_strand = 3u;
