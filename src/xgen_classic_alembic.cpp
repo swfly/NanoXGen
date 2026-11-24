@@ -1358,13 +1358,66 @@ std::uint32_t vertex_index(const LoadedMesh &mesh, std::size_t index,
     return static_cast<std::uint32_t>(value);
 }
 
+LoadedMesh copy_live_mesh(const ClassicMeshInput &input,
+                          const ClassicAlembicLimits &limits) {
+    const auto vertex_count = input.positions.size() / 3u;
+    if (vertex_count == 0u || input.positions.size() % 3u != 0u ||
+        vertex_count > limits.max_vertices ||
+        input.face_counts.empty() || input.face_counts.size() > limits.max_faces ||
+        input.face_indices.size() > limits.max_face_vertices ||
+        (!input.reference_positions.empty() &&
+         input.reference_positions.size() != input.positions.size())) {
+        fail("invalid live patch mesh buffer sizes");
+    }
+    std::size_t index_count = 0u;
+    for (const auto count : input.face_counts) {
+        if (count < 3 || static_cast<std::size_t>(count) >
+                             input.face_indices.size() - index_count) {
+            fail("invalid live patch face counts");
+        }
+        index_count += static_cast<std::size_t>(count);
+    }
+    if (index_count != input.face_indices.size()) {
+        fail("live patch face counts do not match the index buffer");
+    }
+    auto copy_positions = [](std::span<const float> xyz) {
+        std::vector<Imath::V3f> positions;
+        positions.reserve(xyz.size() / 3u);
+        for (std::size_t i = 0; i < xyz.size(); i += 3u) {
+            if (!std::isfinite(xyz[i]) || !std::isfinite(xyz[i + 1]) ||
+                !std::isfinite(xyz[i + 2])) {
+                fail("live patch has a non-finite position");
+            }
+            positions.emplace_back(xyz[i], xyz[i + 1], xyz[i + 2]);
+        }
+        return positions;
+    };
+    LoadedMesh mesh{};
+    mesh.positions = copy_positions(input.positions);
+    mesh.reference_positions = input.reference_positions.empty()
+        ? mesh.positions : copy_positions(input.reference_positions);
+    mesh.face_counts.assign(input.face_counts.begin(), input.face_counts.end());
+    mesh.face_indices.assign(input.face_indices.begin(), input.face_indices.end());
+    for (std::size_t row = 0; row < 4u; ++row) {
+        for (std::size_t col = 0; col < 4u; ++col) {
+            const double coefficient = input.object_to_world[row * 4u + col];
+            if (!std::isfinite(coefficient)) {
+                fail("live patch has a non-finite transform");
+            }
+            mesh.transform[row][col] = coefficient;
+        }
+    }
+    return mesh;
+}
+
 } // namespace
 
 ClassicAlembicAssetInput build_xgen_classic_alembic_asset_input_impl(
     const ClassicDescription &description,
     const std::filesystem::path &archive_path,
     const ClassicAlembicLimits &limits,
-    const ArchiveSampleSelection &selection) {
+    const ArchiveSampleSelection &selection,
+    const ClassicMeshInput *live_mesh = nullptr) {
     if (description.patches.empty()) {
         fail("description has no patches");
     }
@@ -1373,9 +1426,16 @@ ClassicAlembicAssetInput build_xgen_classic_alembic_asset_input_impl(
         limits.max_triangles == 0u) {
         fail("limits must be nonzero");
     }
-    AbcFactory::IFactory factory;
-    const Abc::IArchive archive = factory.getArchive(archive_path.string());
-    if (!archive.valid()) { fail("cannot open archive: " + archive_path.string()); }
+    Abc::IArchive archive;
+    if (live_mesh) {
+        if (description.patches.size() != 1u) {
+            fail("live geometry requires one Classic patch");
+        }
+    } else {
+        AbcFactory::IFactory factory;
+        archive = factory.getArchive(archive_path.string());
+        if (!archive.valid()) { fail("cannot open archive: " + archive_path.string()); }
+    }
 
     ClassicAlembicAssetInput result{};
     const auto reference_surface =
@@ -1384,8 +1444,9 @@ ClassicAlembicAssetInput build_xgen_classic_alembic_asset_input_impl(
     float guide_cage_root_squared_distance_sum = 0.0f;
     std::size_t subdivision_guide_count = 0u;
     for (const ClassicPatch &patch : description.patches) {
-        const LoadedMesh mesh = load_patch_mesh(
-            archive, patch.name, limits, selection);
+        const LoadedMesh mesh = live_mesh
+            ? copy_live_mesh(*live_mesh, limits)
+            : load_patch_mesh(archive, patch.name, limits, selection);
         result.source_vertex_count += mesh.positions.size();
         result.source_face_count += mesh.face_counts.size();
         const std::vector<std::size_t> offsets = face_offsets(mesh);
@@ -1889,6 +1950,13 @@ ClassicAlembicAssetInput build_xgen_classic_alembic_asset_input_impl(
             static_cast<float>(subdivision_guide_count));
     }
     return result;
+}
+
+ClassicAlembicAssetInput build_xgen_classic_mesh_asset_input(
+    const ClassicDescription &description, const ClassicMeshInput &mesh,
+    const ClassicAlembicLimits &limits) {
+    return build_xgen_classic_alembic_asset_input_impl(
+        description, {}, limits, {}, &mesh);
 }
 
 ClassicAlembicAssetInput build_xgen_classic_alembic_asset_input(

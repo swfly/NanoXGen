@@ -394,14 +394,21 @@ build_xgen_classic_collection_execution_plan(
                 output.runtime.fallback_reasons.front());
         }
         const std::uint32_t cvs = output.runtime.fx_cv_count;
-        output.deformation_static =
-            xgen_classic_alembic_deformation_is_static(
+        if (options.live_mesh) {
+            if (collection.descriptions.size() != 1u) {
+                throw std::invalid_argument("live Classic mesh requires one description");
+            }
+            output.surface = build_xgen_classic_mesh_asset_input(
+                description, *options.live_mesh);
+        } else {
+            output.deformation_static = xgen_classic_alembic_deformation_is_static(
                 description, archive_path);
-        output.surface = options.frame_sample
-            ? build_xgen_classic_alembic_asset_input(
-                  description, archive_path, *options.frame_sample)
-            : build_xgen_classic_alembic_asset_input(
-                  description, archive_path);
+            output.surface = options.frame_sample
+                ? build_xgen_classic_alembic_asset_input(
+                      description, archive_path, *options.frame_sample)
+                : build_xgen_classic_alembic_asset_input(
+                      description, archive_path);
+        }
         if (output.runtime.use_guide_cache) {
             const std::filesystem::path cache_path =
                 resolve_guide_cache_path(
