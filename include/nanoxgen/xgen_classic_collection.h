@@ -24,6 +24,8 @@ struct ClassicCollectionExecutionOptions {
     // separate from motion sampling avoids building motion tables for one
     // output while still evaluating animated Alembic geometry correctly.
     std::optional<ClassicAlembicFrameSample> frame_sample;
+    // One supplied cage for a single-description, single-patch plan.
+    const ClassicMeshInput *live_mesh{};
     // Optional context shared by description, PTEX, clump, and later JIT work.
     // A null context creates an affinity-aware pool for this call and releases
     // it on return. A supplied context must outlive this call.

@@ -3,7 +3,9 @@
 #include "nanoxgen/asset.h"
 #include "nanoxgen/xgen_classic.h"
 
+#include <array>
 #include <cstddef>
+#include <span>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -91,6 +93,21 @@ struct ClassicAlembicAssetInput {
     float guide_cage_root_rms_distance{};
     float guide_cage_root_max_distance{};
 };
+
+// One evaluated patch cage. Positions are packed xyz in object space, with
+// face indices in the winding order used by Alembic. The optional reference
+// positions have the same topology and are transformed by object_to_world.
+struct ClassicMeshInput {
+    std::span<const float> positions;
+    std::span<const float> reference_positions;
+    std::span<const std::int32_t> face_counts;
+    std::span<const std::int32_t> face_indices;
+    std::array<double, 16> object_to_world;
+};
+
+[[nodiscard]] ClassicAlembicAssetInput build_xgen_classic_mesh_asset_input(
+    const ClassicDescription &description, const ClassicMeshInput &mesh,
+    const ClassicAlembicLimits &limits = {});
 
 // Read the first Alembic sample for each Classic patch, select only its
 // declared face IDs, triangulate those faces, and turn embedded relative guide
